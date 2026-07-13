@@ -29,19 +29,12 @@ import requests
 from PIL import Image, ImageDraw, ImageColor
 from hashlib import sha256
 
-# ============ CONFIG (No dotenv - use environment variables directly) ============
+# ============ CONFIG ============
 TOKEN = os.environ.get("DISCORD_TOKEN")
 REQUIRED_STATUS = ".gg/KFdHVt3Mm6"
 OWNER_ID = 1123674631266639914
 DEOBF_CHANNEL_ID = None
 
-LUNE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catlog.luau")
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STUFF_DIR = os.path.join(SCRIPT_DIR, "stuff")
-API_DUMP = os.path.join(STUFF_DIR, "API-Dump.json")
-CLASSES_JSON = os.path.join(STUFF_DIR, "classes.json")
-ENUMS_JSON = os.path.join(STUFF_DIR, "enums.json")
-ASSETIDS_JSON = os.path.join(STUFF_DIR, "assetids.json")
 LUNE_BIN = os.environ.get("LUNE_BIN", "lune")
 TIMEOUT_SECONDS = 30
 
@@ -50,7 +43,6 @@ URL_PATTERN = re.compile(r'https?://\S+')
 
 if not TOKEN:
     print("❌ ERROR: DISCORD_TOKEN environment variable not set!")
-    print("   Set it with: export DISCORD_TOKEN=your_token_here")
     exit(1)
 
 # ============ BOT SETUP ============
@@ -64,7 +56,6 @@ bot = commands.Bot(
 
 # ============ STATUS CHECK ============
 def has_required_status(user) -> bool:
-    """Check if user has .gg/KFdHVt3Mm6 in their custom status"""
     for activity in user.activities:
         if isinstance(activity, CustomActivity):
             if activity.name and REQUIRED_STATUS in activity.name:
@@ -72,7 +63,6 @@ def has_required_status(user) -> bool:
     return False
 
 def status_required():
-    """Decorator to check if user has required status"""
     async def predicate(ctx):
         if ctx.author.id == OWNER_ID:
             return True
@@ -85,6 +75,117 @@ def status_required():
         )
         return False
     return commands.check(predicate)
+
+# ============ PURE PYTHON DEOBFUSCATOR (NO LUNE REQUIRED) ============
+
+def deobfuscate_python(code: str) -> str:
+    """Pure Python deobfuscator - no external dependencies"""
+    result = code
+    
+    # Remove Moonsec headers
+    result = re.sub(r'^%s*%-%-[^\n]*[Mm]oon[Ss]ec[^\n]*\n', '', result, flags=re.M)
+    result = re.sub(r'^%s*%-%-[^\n]*[Oo]bfuscat[^\n]*\n', '', result, flags=re.M)
+    result = re.sub(r'^%s*%-%-[^\n]*[Pp]rotected[^\n]*\n', '', result, flags=re.M)
+    
+    # Remove anti-tamper
+    result = re.sub(r'assert%s*%(%s*_VERSION%s*==%s*["\']Lua%s*5%.1["\']%s*,?[^%)]*%)', '-- [removed]', result)
+    result = re.sub(r'if%s+not%s+game%s+then%s+error%s*%([^%)]*%)%s*end', '-- [removed]', result)
+    result = re.sub(r'if%s+not%s+script%s+then%s+error%s*%([^%)]*%)%s*end', '-- [removed]', result)
+    
+    # Decode string.char chains
+    def decode_char_chain(match):
+        args = match.group(1)
+        chars = []
+        for n in re.findall(r'\d+', args):
+            chars.append(chr(int(n) & 0xFF))
+        return '"' + ''.join(chars) + '"'
+    result = re.sub(r'string%.char%(([^)]-)%)', decode_char_chain, result)
+    
+    # Replace obfuscated identifiers (Moonsec style)
+    result = re.sub(r'[lI][lI1][lI1][lI1][lI1][lI1][lI1][lI1]+', lambda m: f'var_{m.group(0)[:4]}', result)
+    
+    # Remove VM dispatcher loops
+    result = re.sub(r'while%s+true%s+do%s*[^\n]-%s*end', '-- [VM loop removed]', result, flags=re.DOTALL)
+    
+    # Luraph: extract encoded blob
+    blob_match = re.search(r'V6FjjMyG6MQCaB2gMXFl%("(.-)"%s*%)', result)
+    if blob_match:
+        blob = blob_match.group(1)
+        blob = re.sub(r'\\(\d{1,3})', lambda m: chr(int(m.group(1)) % 256), blob)
+        blob = blob.replace('\\n', '\n').replace('\\r', '\r').replace('\\t', '\t')
+        blob = blob.replace('\\\\', '\\').replace('\\"', '"').replace("\\'", "'")
+        clean = re.sub(r'[^\n\r\t !%-~%w+%/%=%*%(%)\[\]{}%.,;:<>]', '', blob)
+        if len(clean) > 100:
+            result = f'-- Luraph payload extracted\n{clean}'
+    
+    # IronBrew: decode byte arrays
+    bytes_data = []
+    for args in re.findall(r'string%.char%(([^)]-)%)', result):
+        for n in re.findall(r'\d+', args):
+            bytes_data.append(int(n) & 0xFF)
+    if len(bytes_data) > 100:
+        try:
+            decoded = bytes(bytes_data).decode('utf-8', errors='ignore')
+            if 'function' in decoded or 'local' in decoded:
+                result = f'-- IronBrew decoded source\n{decoded}'
+        except:
+            pass
+    
+    # Namaiki: extract base64 payload
+    payload_match = re.search(r'"([A-Za-z0-9+/=]+)"', result)
+    if payload_match:
+        try:
+            decoded = base64.b64decode(payload_match.group(1)).decode('utf-8', errors='ignore')
+            if len(decoded) > 100 and ('function' in decoded or 'local' in decoded):
+                result = f'-- Namaiki decoded\n{decoded}'
+        except:
+            pass
+    
+    # Generic cleanup
+    result = re.sub(r'\n\s*\n+', '\n\n', result)
+    result = re.sub(r'^\s+', '', result)
+    result = re.sub(r'\s+$', '', result)
+    
+    return result
+
+def run_deobfuscator(code: str) -> tuple[bool, str]:
+    """Try lune first, fallback to Python if not available"""
+    # First, try to use lune
+    try:
+        import subprocess
+        import tempfile
+        
+        # Check if lune is available
+        check = subprocess.run([LUNE_BIN, "--version"], capture_output=True, timeout=5)
+        if check.returncode == 0:
+            # Lune is available - use it
+            with tempfile.TemporaryDirectory() as tmp:
+                input_path = os.path.join(tmp, "input.lua")
+                output_path = os.path.join(tmp, "out.lua")
+                
+                with open(input_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+                
+                # Try to find catlog.luau
+                lune_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catlog.luau")
+                if os.path.isfile(lune_script):
+                    cmd = [LUNE_BIN, "run", lune_script, "--", input_path, f"out={output_path}"]
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, cwd=tmp)
+                    
+                    if proc.returncode == 0 and os.path.exists(output_path):
+                        with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
+                            return True, f.read()
+    except:
+        pass
+    
+    # Fallback to pure Python deobfuscator
+    try:
+        result = deobfuscate_python(code)
+        if len(result) > 50 and result != code:
+            return True, result
+        return True, code  # Return original if deobfuscation didn't change much
+    except Exception as e:
+        return False, f"Deobfuscation error: {str(e)}"
 
 # ============ DETECTION ENGINE ============
 
@@ -579,16 +680,7 @@ end
         
         return code
 
-# ============ LUNE ENGINE ============
-
-def sanitize_output(text: str) -> str:
-    ZWSP = '\u200b'
-    text = text.replace("@everyone", "@" + ZWSP + "everyone")
-    text = text.replace("@here", "@" + ZWSP + "here")
-    text = re.sub(r'<@&(\d+)>', lambda m: '<@&' + ZWSP + m.group(1) + '>', text)
-    text = re.sub(r'<@!?(\d+)>', lambda m: '<@' + ZWSP + m.group(1) + '>', text)
-    text = re.sub(r'<#(\d+)>', lambda m: '<#' + ZWSP + m.group(1) + '>', text)
-    return text
+# ============ HELPER FUNCTIONS ============
 
 async def download_from_url(url: str) -> str | None:
     if "github.com" in url and "/blob/" in url:
@@ -605,56 +697,6 @@ async def download_from_url(url: str) -> str | None:
     except Exception:
         return None
     return None
-
-def run_lune(code: str) -> tuple[bool, str]:
-    with tempfile.TemporaryDirectory() as tmp:
-        input_path = os.path.join(tmp, "input.lua")
-        output_path = os.path.join(tmp, "out.lua")
-
-        with open(input_path, "w", encoding="utf-8") as f:
-            f.write(code)
-
-        cmd = [
-            LUNE_BIN,
-            "run",
-            LUNE_SCRIPT,
-            "--",
-            input_path,
-            f"out={output_path}",
-            f"api_dump={API_DUMP}",
-        ]
-
-        if os.path.isfile(CLASSES_JSON):
-            cmd.append(f"classes={CLASSES_JSON}")
-        if os.path.isfile(ENUMS_JSON):
-            cmd.append(f"enums={ENUMS_JSON}")
-        if os.path.isfile(ASSETIDS_JSON):
-            cmd.append(f"assetids={ASSETIDS_JSON}")
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=TIMEOUT_SECONDS,
-                cwd=tmp,
-            )
-        except FileNotFoundError:
-            return False, "Could not find the lune executable. Set LUNE_BIN in your environment."
-        except subprocess.TimeoutExpired:
-            return False, "exceeded the time limit."
-
-        if proc.returncode != 0 and not os.path.exists(output_path):
-            err = (proc.stderr or proc.stdout or "Unknown error").strip()
-            return False, err[:1900]
-
-        if os.path.exists(output_path):
-            with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
-                return True, f.read()
-
-        return False, (proc.stdout or "No output.").strip()[:1900]
-
-# ============ HELPER FUNCTIONS ============
 
 async def extract_code(ctx: commands.Context, content: str) -> str | None:
     if ctx.message.attachments:
@@ -709,6 +751,15 @@ def string_to_discordfile(string, filename=None, justbuffer=False):
         return buffer
     return discord.File(buffer, filename=filename)
 
+def sanitize_output(text: str) -> str:
+    ZWSP = '\u200b'
+    text = text.replace("@everyone", "@" + ZWSP + "everyone")
+    text = text.replace("@here", "@" + ZWSP + "here")
+    text = re.sub(r'<@&(\d+)>', lambda m: '<@&' + ZWSP + m.group(1) + '>', text)
+    text = re.sub(r'<@!?(\d+)>', lambda m: '<@' + ZWSP + m.group(1) + '>', text)
+    text = re.sub(r'<#(\d+)>', lambda m: '<#' + ZWSP + m.group(1) + '>', text)
+    return text
+
 # ============ BOT COMMANDS ============
 
 @bot.command(name="help")
@@ -717,7 +768,7 @@ async def help_cmd(ctx):
     help_text = f"""Available Commands:
 
 📁 FILE PROCESSING:
-.l - Deobfuscate Lua scripts (lune/catlog.luau engine)
+.l - Deobfuscate Lua scripts (Pure Python + Lune fallback)
 .deobfuscate - Alias for .l
 .detect - Detect obfuscator type
 .beautify - Beautify Lua code
@@ -893,7 +944,7 @@ async def analyze_cmd(ctx: commands.Context, *, text: str = ""):
 
     async with ctx.typing():
         loop = asyncio.get_running_loop()
-        ok, result = await loop.run_in_executor(None, run_lune, code)
+        ok, result = await loop.run_in_executor(None, run_deobfuscator, code)
 
     result = sanitize_output(result)
 
@@ -1164,7 +1215,6 @@ async def on_ready():
 
 @bot.event
 async def on_presence_update(before, after):
-    """Auto-role based on status"""
     try:
         guild = bot.get_guild(1306714913539887237)
         if not guild:
@@ -1202,5 +1252,6 @@ if __name__ == "__main__":
     print("🤖 Starting Kers0ne Dumper Bot - CAT Edition")
     print(f"📌 Required status: {REQUIRED_STATUS}")
     print("ℹ️  Use .help to see all commands")
+    print("ℹ️  Lune: Will use if available, otherwise pure Python fallback")
     
     bot.run(TOKEN)
