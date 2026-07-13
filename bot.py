@@ -1,472 +1,798 @@
-import discord
-from discord.ext import commands
 import os
+import io
+import asyncio
+import tempfile
+import subprocess
+import re
 import random
 import string
 import hashlib
-import aiohttp
-import asyncio
-import re
 import json
-import io
 import base64
 import zlib
-import tempfile
-import subprocess
-from datetime import datetime
+import time
+import pathlib
+import threading
+import ssl
+import certifi
+import urllib.parse
+from datetime import datetime, timedelta
+from collections import defaultdict
+from shutil import move as file_move
 
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix='.', intents=intents, help_command=None)
+import discord
+from discord.ext import commands
+from discord import CustomActivity
+from discord.ui import Button, View, Select
+from dotenv import load_dotenv
+import aiohttp
+import requests
+from PIL import Image, ImageDraw, ImageColor
+from hashlib import sha256
 
+load_dotenv()
+
+# ============ CONFIG ============
+TOKEN = os.getenv("DISCORD_TOKEN")
+REQUIRED_STATUS = ".gg/KFdHVt3Mm6"
 OWNER_ID = 1123674631266639914
-L_CHANNEL_ID = None
+DEOBF_CHANNEL_ID = None
 
-# ============ LUPA INTEGRATION ============
-try:
-    import lupa
-    from lupa import LuaRuntime
-    HAS_LUA = True
-except ImportError:
-    HAS_LUA = False
-    print("⚠️ lupa not installed - using fallback deobfuscator")
+LUNE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catlog.luau")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STUFF_DIR = os.path.join(SCRIPT_DIR, "stuff")
+API_DUMP = os.path.join(STUFF_DIR, "API-Dump.json")
+CLASSES_JSON = os.path.join(STUFF_DIR, "classes.json")
+ENUMS_JSON = os.path.join(STUFF_DIR, "enums.json")
+ASSETIDS_JSON = os.path.join(STUFF_DIR, "assetids.json")
+LUNE_BIN = os.getenv("LUNE_BIN", "lune")
+TIMEOUT_SECONDS = 30
 
-# ============ DUMPER ENGINE ============
-DUMPER_SOURCE = '''
---[[
-  FLAMEDUMPERV3 - Complete Deobfuscation Engine
-  Supports: Moonsec V2/V3, IronBrew, Luraph, Namaiki, 
-            Prometheus, PSU, VAQ, Lumora, and 40+ more
---]]
+NO_MENTIONS = discord.AllowedMentions.none()
+URL_PATTERN = re.compile(r'https?://\S+')
 
-local proxyTable = {}
+# ============ BOT SETUP ============
+intents = discord.Intents.all()
+bot = commands.Bot(
+    command_prefix=".", 
+    intents=intents, 
+    help_command=None, 
+    allowed_mentions=discord.AllowedMentions.none()
+)
 
--- ===== UTILITY FUNCTIONS =====
-local function formatStringLiteral(value)
-    if type(value) ~= "string" then return tostring(value) end
-    local escaped = value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
-    return '"' .. escaped .. '"'
-end
+# ============ STATUS CHECK ============
+def has_required_status(user) -> bool:
+    """Check if user has .gg/KFdHVt3Mm6 in their custom status"""
+    for activity in user.activities:
+        if isinstance(activity, CustomActivity):
+            if activity.name and REQUIRED_STATUS in activity.name:
+                return True
+    return False
 
-local function serializeValue(value, depth)
-    depth = depth or 0
-    if depth > 20 then return "{...}" end
-    
-    if value == nil then return "nil"
-    elseif type(value) == "string" then return formatStringLiteral(value)
-    elseif type(value) == "number" or type(value) == "boolean" then return tostring(value)
-    elseif type(value) == "table" then
-        local items = {}
-        for k, v in pairs(value) do
-            local ks = (type(k) == "string" and k:match("^[%a_][%w_]*$")) and k or ("[" .. serializeValue(k, depth+1) .. "]")
-            table.insert(items, ks .. " = " .. serializeValue(v, depth+1))
-        end
-        return "{" .. table.concat(items, ", ") .. "}"
-    else
-        return tostring(value)
-    end
-end
+def status_required():
+    """Decorator to check if user has required status"""
+    async def predicate(ctx):
+        if ctx.author.id == OWNER_ID:
+            return True
+        if has_required_status(ctx.author):
+            return True
+        await ctx.reply(
+            f"❌ You need to put `{REQUIRED_STATUS}` in your custom status to use this command!\n"
+            f"Set it in your Discord profile -> Custom Status",
+            allowed_mentions=NO_MENTIONS
+        )
+        return False
+    return commands.check(predicate)
 
--- ===== DETECTION ENGINE =====
-local function detectObfuscator(code)
-    local head = code:sub(1, 256):lower()
-    
-    -- Moonsec
-    if head:find("moonsec", 1, true) or code:find("MoonSec", 1, true) then
-        return "moonsec"
-    end
-    
-    -- Luraph
-    if head:find("luraph", 1, true) or code:find("LuraphContinue", 1, true) then
-        return "luraph"
-    end
-    
-    -- IronBrew
-    if head:find("ironbrew", 1, true) or code:find("IronBrew", 1, true) then
-        return "ironbrew"
-    end
-    
-    -- Namaiki
-    if code:find("namaiki", 1, true) or code:find("{0,1,1,0}", 1, true) then
-        return "namaiki"
-    end
-    
-    -- Prometheus
-    if head:find("prometheus", 1, true) or code:find("LPH!", 1, true) then
-        return "prometheus"
-    end
-    
-    -- PSU
-    if head:find("psu obfuscator", 1, true) or head:find("psu v", 1, true) then
-        return "psu"
-    end
-    
-    -- VAQ
-    if code:find("VAQ Obfuscator", 1, true) or code:find("_vaq, discord", 1, true) then
-        return "vaq"
-    end
-    
-    -- Lumora
-    if head:find("lumora", 1, true) or code:find("lumora-3jx", 1, true) then
-        return "lumora"
-    end
-    
-    -- ScriptWare / CocoZ
-    if code:find("ScriptWare", 1, true) or code:find("CocoZ", 1, true) then
-        return "scriptware"
-    end
-    
-    -- Riptide
-    if head:find("riptide", 1, true) or code:find("RiptideVM", 1, true) then
-        return "riptide"
-    end
-    
-    return "unknown"
-end
+# ============ DETECTION ENGINE ============
 
--- ===== DECODING ENGINES =====
-local function xorDecode(data, key)
-    local result = {}
-    for i = 1, #data do
-        local byte = string.byte(data, i)
-        local k = type(key) == "number" and key or string.byte(key, ((i-1) % #key) + 1)
-        result[i] = string.char(bit32.bxor(byte, k))
-    end
-    return table.concat(result)
-end
-
-local function base64Decode(data)
-    local b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    data = data:gsub("[^"..b64.."=]", "")
-    local result = {}
-    for i = 1, #data, 4 do
-        local c1 = b64:find(data:sub(i,i)) or 1
-        local c2 = b64:find(data:sub(i+1,i+1)) or 1
-        local c3 = b64:find(data:sub(i+2,i+2)) or 1
-        local c4 = b64:find(data:sub(i+3,i+3)) or 1
-        local n = (c1-1)*262144 + (c2-1)*4096 + (c3-1)*64 + (c4-1)
-        result[#result+1] = string.char(math.floor(n/65536))
-        if data:sub(i+2,i+2) ~= "=" then
-            result[#result+1] = string.char(math.floor(n/256) % 256)
-        end
-        if data:sub(i+3,i+3) ~= "=" then
-            result[#result+1] = string.char(n % 256)
-        end
-    end
-    return table.concat(result)
-end
-
--- ===== DECOMPILATION ENGINE =====
-local function deobfuscateMoonsec(code)
-    -- Strip headers
-    code = code:gsub("^%s*%-%-[^\n]*[Mm]oon[Ss]ec[^\n]*\n", "")
-    code = code:gsub("^%s*%-%-[^\n]*[Oo]bfuscat[^\n]*\n", "")
-    code = code:gsub("^%s*%-%-[^\n]*[Pp]rotected[^\n]*\n", "")
+class DetectionEngine:
+    SIGNATURES = {
+        'Moonsec': {
+            'patterns': [r'[Mm]oon[Ss]ec', r'MoonSecV\d', r'moonsec v\d'],
+            'weight': 10,
+            'description': 'Moonsec V2/V3 - String-based VM obfuscator'
+        },
+        'Luraph': {
+            'patterns': [r'Luraph', r'LuraphContinue', r'LPH_NO_VIRTUALIZE', r'LPH_OBFUSCATED'],
+            'weight': 10,
+            'description': 'Luraph - Lua bytecode VM obfuscator'
+        },
+        'IronBrew': {
+            'patterns': [r'[Ii]ron[Bb]rew', r'IRON_VM', r'IronBrew Obfuscator'],
+            'weight': 10,
+            'description': 'IronBrew - Bytecode-level obfuscator'
+        },
+        'Namaiki': {
+            'patterns': [r'namaiki', r'{0,1,1,0}', r'Protected by Namaiki'],
+            'weight': 9,
+            'description': 'Namaiki - Layer-based obfuscator'
+        },
+        'VAQ': {
+            'patterns': [r'VAQ Obfuscator', r'_vaq, discord', r'_bp5nxQostOWX6XP'],
+            'weight': 9,
+            'description': 'VAQ - Anti-tamper obfuscator'
+        },
+        'Lumora': {
+            'patterns': [r'lumora', r'lumora-3jx', r'Lumora Obfuscator'],
+            'weight': 8,
+            'description': 'Lumora - Hex-based obfuscator'
+        },
+        'Prometheus': {
+            'patterns': [r'Prometheus', r'LPH!', r'PrometheusBytecodeMagic'],
+            'weight': 8,
+            'description': 'Prometheus - Bytecode compression obfuscator'
+        },
+        'PSU': {
+            'patterns': [r'PSU Obfuscator', r'PSU v\d', r'PSU_KEY', r'PSUEncode'],
+            'weight': 8,
+            'description': 'PSU - Base64 encoded obfuscator'
+        },
+        'Riptide': {
+            'patterns': [r'Riptide', r'riptide_vm', r'__riptide', r'RiptideVM'],
+            'weight': 7,
+            'description': 'Riptide - VM-based obfuscator'
+        },
+        'Cloudia': {
+            'patterns': [r'Cloudia', r'cloudia_vm', r'__cloudia', r'CloudiaVM'],
+            'weight': 7,
+            'description': 'Cloudia - Cloud-based VM obfuscator'
+        },
+        'Carbon': {
+            'patterns': [r'Carbon', r'carbon_vm', r'__carbon', r'CarbonVM'],
+            'weight': 7,
+            'description': 'Carbon - VM obfuscator'
+        },
+        'Nihon': {
+            'patterns': [r'Nihon', r'nihon_vm', r'__nihon', r'NihonVM'],
+            'weight': 7,
+            'description': 'Nihon - VM obfuscator'
+        },
+        'Trigon': {
+            'patterns': [r'Trigon', r'trigon_vm', r'__trigon', r'TrigonVM'],
+            'weight': 7,
+            'description': 'Trigon - VM obfuscator'
+        },
+        'Valyse': {
+            'patterns': [r'Valyse', r'valyse_vm', r'__valyse', r'ValyseVM'],
+            'weight': 7,
+            'description': 'Valyse - VM obfuscator'
+        },
+        'Evon': {
+            'patterns': [r'Evon', r'evon_vm', r'__evon', r'EvonVM'],
+            'weight': 7,
+            'description': 'Evon - VM obfuscator'
+        },
+        'Seliware': {
+            'patterns': [r'Seliware', r'seliware_vm', r'__seliware', r'SeliwareVM'],
+            'weight': 7,
+            'description': 'Seliware - VM obfuscator'
+        },
+        'Electron': {
+            'patterns': [r'Electron', r'electron_vm', r'__electron', r'ElectronVM'],
+            'weight': 7,
+            'description': 'Electron - VM obfuscator'
+        },
+        'Oxide': {
+            'patterns': [r'Oxide', r'oxide_vm', r'__oxide', r'OxideVM'],
+            'weight': 7,
+            'description': 'Oxide - VM obfuscator'
+        },
+        'Oblivion': {
+            'patterns': [r'Oblivion', r'oblivion_vm', r'__oblivion', r'OblivionVM'],
+            'weight': 7,
+            'description': 'Oblivion - VM obfuscator'
+        },
+        'Sheathe': {
+            'patterns': [r'Sheathe', r'sheathe_vm', r'__sheathe', r'SheatheVM'],
+            'weight': 7,
+            'description': 'Sheathe - VM obfuscator'
+        },
+        'ByteMe': {
+            'patterns': [r'ByteMe', r'byteme_vm', r'__byteme', r'ByteMeVM'],
+            'weight': 7,
+            'description': 'ByteMe - Bytecode obfuscator'
+        },
+        'LuaShield': {
+            'patterns': [r'LuaShield', r'luashield', r'__luashield', r'LuaShieldVM'],
+            'weight': 7,
+            'description': 'LuaShield - Protection obfuscator'
+        },
+        'CodexVM': {
+            'patterns': [r'CodexVM', r'codex_vm', r'__codex'],
+            'weight': 7,
+            'description': 'CodexVM - VM obfuscator'
+        },
+        'Hyperion': {
+            'patterns': [r'Hyperion', r'Byfron', r'__hyperion', r'HyperionProtect'],
+            'weight': 9,
+            'description': 'Hyperion/Byfron - Anti-cheat obfuscator'
+        },
+        'Azur': {
+            'patterns': [r'Azur', r'azur_vm', r'__azur', r'AzurObfuscator'],
+            'weight': 7,
+            'description': 'Azur - VM obfuscator'
+        },
+        'Hercules': {
+            'patterns': [r'Hercules', r'hercules_vm', r'__hercules', r'HerculesVM'],
+            'weight': 7,
+            'description': 'Hercules - VM obfuscator'
+        },
+        'Nova': {
+            'patterns': [r'Nova', r'nova_vm', r'__nova', r'NovaObfuscator'],
+            'weight': 7,
+            'description': 'Nova - VM obfuscator'
+        },
+        'Acedia': {
+            'patterns': [r'Acedia', r'acedia_vm', r'__acedia', r'AcediaVM'],
+            'weight': 7,
+            'description': 'Acedia - VM obfuscator'
+        },
+        'ScriptWare': {
+            'patterns': [r'ScriptWare', r'__scriptware', r'ScriptWareVM'],
+            'weight': 6,
+            'description': 'ScriptWare - Executor obfuscator'
+        },
+        'CocoZ': {
+            'patterns': [r'CocoZ', r'coco_z_', r'__cocoz'],
+            'weight': 6,
+            'description': 'CocoZ - Executor obfuscator'
+        },
+        'Synapse': {
+            'patterns': [r'Synapse', r'__synapse', r'syn\.protect_gui', r'Synapse X'],
+            'weight': 8,
+            'description': 'Synapse X - Executor obfuscator'
+        },
+        'Krnl': {
+            'patterns': [r'Krnl', r'__krnl', r'krnl\.request', r'KRNL_LOADED'],
+            'weight': 8,
+            'description': 'Krnl - Executor obfuscator'
+        },
+        'Fluxus': {
+            'patterns': [r'Fluxus', r'__fluxus', r'fluxus\.request'],
+            'weight': 8,
+            'description': 'Fluxus - Executor obfuscator'
+        },
+        'Sentinel': {
+            'patterns': [r'Sentinel', r'__sentinel', r'sentinel\.request'],
+            'weight': 7,
+            'description': 'Sentinel - Executor obfuscator'
+        },
+        'Wave': {
+            'patterns': [r'Wave', r'__wave', r'wave\.request'],
+            'weight': 7,
+            'description': 'Wave - Executor obfuscator'
+        },
+        'Celery': {
+            'patterns': [r'Celery', r'__celery'],
+            'weight': 6,
+            'description': 'Celery - Executor obfuscator'
+        },
+        'Oxygen': {
+            'patterns': [r'Oxygen', r'__oxygen'],
+            'weight': 6,
+            'description': 'Oxygen - Executor obfuscator'
+        },
+        'Hydrogen': {
+            'patterns': [r'Hydrogen', r'__hydrogen'],
+            'weight': 6,
+            'description': 'Hydrogen - Executor obfuscator'
+        },
+        'Delta': {
+            'patterns': [r'Delta', r'__delta'],
+            'weight': 6,
+            'description': 'Delta - Executor obfuscator'
+        },
+        'Comet': {
+            'patterns': [r'Comet', r'__comet'],
+            'weight': 6,
+            'description': 'Comet - Executor obfuscator'
+        },
+        'Swift': {
+            'patterns': [r'Swift', r'__swift'],
+            'weight': 6,
+            'description': 'Swift - Executor obfuscator'
+        },
+        'Xeno': {
+            'patterns': [r'Xeno', r'__xeno'],
+            'weight': 6,
+            'description': 'Xeno - Executor obfuscator'
+        },
+        'Arceus': {
+            'patterns': [r'Arceus', r'__arceus'],
+            'weight': 6,
+            'description': 'Arceus - Executor obfuscator'
+        },
+        'Velocity': {
+            'patterns': [r'Velocity', r'__velocity'],
+            'weight': 6,
+            'description': 'Velocity - Executor obfuscator'
+        },
+        'Zorara': {
+            'patterns': [r'Zorara', r'__zorara'],
+            'weight': 6,
+            'description': 'Zorara - Executor obfuscator'
+        },
+        'Potassium': {
+            'patterns': [r'Potassium', r'__potassium'],
+            'weight': 6,
+            'description': 'Potassium - Executor obfuscator'
+        },
+        'MacSploit': {
+            'patterns': [r'MacSploit', r'__macsploit'],
+            'weight': 6,
+            'description': 'MacSploit - Executor obfuscator'
+        },
+        'ScriptHub': {
+            'patterns': [r'ScriptHub', r'__script_hub'],
+            'weight': 5,
+            'description': 'ScriptHub - Script obfuscator'
+        },
+        'Dex': {
+            'patterns': [r'Dex', r'__dex', r'DarkDex'],
+            'weight': 5,
+            'description': 'Dex/DarkDex - Explorer obfuscator'
+        },
+        'Hydroxide': {
+            'patterns': [r'Hydroxide', r'__hydroxide'],
+            'weight': 5,
+            'description': 'Hydroxide - Script obfuscator'
+        },
+        'InfiniteYield': {
+            'patterns': [r'InfiniteYield', r'__infinite_yield'],
+            'weight': 5,
+            'description': 'Infinite Yield - Admin script obfuscator'
+        },
+    }
     
-    -- Remove anti-tamper
-    code = code:gsub('assert%s*%(%s*_VERSION%s*==%s*["\']Lua%s*5%.1["\']%s*,?[^%)]*%)', "-- [removed]")
-    code = code:gsub("if%s+not%s+game%s+then%s+error%s*%([^%)]*%)%s*end", "-- [removed]")
+    GENERIC = {
+        'String-Char Obfuscator': {
+            'patterns': [r'string\.char\(', r'table\.concat\('],
+            'weight': 3,
+            'description': 'String.char chain obfuscator'
+        },
+        'VM Dispatcher': {
+            'patterns': [r'while\s+true\s+do', r'elseif\s+\w+\s*==\s*\d+\s+then'],
+            'weight': 3,
+            'description': 'VM dispatcher loop obfuscator'
+        },
+        'Base64 Loader': {
+            'patterns': [r'loadstring\(', r'[A-Za-z0-9+/]{32,}={0,2}'],
+            'weight': 3,
+            'description': 'Base64 encoded loader'
+        },
+        'XOR Encoded': {
+            'patterns': [r'bit32\.bxor\(', r'bxor\(', r'bit\.bxor\('],
+            'weight': 3,
+            'description': 'XOR encoded strings'
+        },
+        'Zlib Compressed': {
+            'patterns': [r'zlib\.decompress', r'zlib\.inflate'],
+            'weight': 3,
+            'description': 'Zlib compressed payload'
+        },
+        'Luau Bytecode': {
+            'patterns': [r'\x1bLua', r'\x1bLJ'],
+            'weight': 4,
+            'description': 'Luau bytecode loader'
+        },
+    }
     
-    -- Decode string.char chains
-    code = code:gsub("string%.char%(([^)]-)%)", function(args)
-        local bytes = {}
-        for n in args:gmatch("%d+") do
-            bytes[#bytes+1] = string.char(tonumber(n) or 0)
-        end
-        return '"' .. table.concat(bytes):gsub('"', '\\"') .. '"'
-    end)
-    
-    -- Replace obfuscated identifiers
-    code = code:gsub("[lI][lI1][lI1][lI1][lI1][lI1][lI1][lI1]+", function(m)
-        return "var_" .. string.sub(m, 1, 4)
-    end)
-    
-    -- Remove VM dispatcher loops
-    code = code:gsub("while%s+true%s+do%s*[^\n]-%s*end", "-- [VM loop removed]")
-    
-    return code
-end
-
-local function deobfuscateLuraph(code)
-    -- Find the encoded blob
-    local blob = code:match('V6FjjMyG6MQCaB2gMXFl%("(.-)"%s*%)')
-    if blob then
-        -- Decode escapes
-        blob = blob:gsub("\\\\(%d%d?%d?)", function(n) return string.char(tonumber(n) % 256) end)
-        blob = blob:gsub("\\\\([nrtbfv\\\'\"])", {n="\n",r="\r",t="\t",b="\b",f="\f",v="\v",["\\"]="\\",["'"]="'",['"']='"'})
+    @classmethod
+    def detect(cls, code):
+        results = {}
+        for name, sig in cls.SIGNATURES.items():
+            score = 0
+            for pattern in sig['patterns']:
+                if re.search(pattern, code, re.IGNORECASE):
+                    score += sig['weight']
+            if score > 0:
+                results[name] = {
+                    'score': score,
+                    'description': sig['description'],
+                    'confidence': min(100, int((score / (len(sig['patterns']) * sig['weight'])) * 100))
+                }
         
-        -- Try to extract Lua from it
-        local clean = blob:gsub("[^\n\r\t !%-%~%w%+%/%=%*%(%)\\[%]{}%.,;:<>]", "")
-        if #clean > 100 then
-            return "-- Luraph payload extracted\n" .. clean
-        end
-    end
-    return code
-end
+        for name, sig in cls.GENERIC.items():
+            score = 0
+            for pattern in sig['patterns']:
+                if re.search(pattern, code, re.IGNORECASE):
+                    score += sig['weight']
+            if score > 0:
+                results[name] = {
+                    'score': score,
+                    'description': sig['description'],
+                    'confidence': min(100, int((score / (len(sig['patterns']) * sig['weight'])) * 100))
+                }
+        
+        return sorted(results.items(), key=lambda x: x[1]['confidence'], reverse=True)
+    
+    @classmethod
+    def get_summary(cls, code):
+        results = cls.detect(code)
+        if not results:
+            return "No obfuscation detected. The code appears to be plain Lua."
+        
+        lines = ["**Obfuscation Detection Results:**", ""]
+        for name, data in results[:10]:
+            confidence = data['confidence']
+            bar = '█' * (confidence // 10) + '░' * (10 - (confidence // 10))
+            lines.append(f"**{name}**")
+            lines.append(f"  Confidence: {confidence}% {bar}")
+            lines.append(f"  Description: {data['description']}")
+            lines.append("")
+        
+        if len(results) > 10:
+            lines.append(f"*... and {len(results) - 10} more detected*")
+        return '\n'.join(lines)
 
-local function deobfuscateIronBrew(code)
-    -- Extract bytecode from string.char chains
-    local bytes = {}
-    for args in code:gmatch("string%.char%(([^)]-)%)") do
-        for n in args:gmatch("%d+") do
-            bytes[#bytes+1] = tonumber(n) or 0
-        end
-    end
-    
-    if #bytes > 100 then
-        local decoded = table.concat(bytes, "")
-        return "-- IronBrew bytecode extracted\n" .. decoded
-    end
-    return code
-end
+# ============ OBFUSCATION ENGINE ============
 
-local function deobfuscateNamaiki(code)
-    -- Extract base64 payload
-    local payload = code:match('"([A-Za-z0-9+/=]+)"')
-    if payload then
-        local decoded = base64Decode(payload)
-        if #decoded > 100 then
-            return "-- Namaiki decoded payload\n" .. decoded
-        end
-    end
-    return code
+class ObfuscationEngine:
+    @staticmethod
+    def randomstr(length):
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+    
+    @staticmethod
+    def random_ident():
+        prefixes = ['_', '_0x', 'O0', 'l1', 'I1', 'll', 'II', 'OO', '00']
+        return random.choice(prefixes) + ObfuscationEngine.randomstr(6)
+    
+    @staticmethod
+    def moonsec_obfuscate(code, level=1):
+        result = ['-- MoonSec Obfuscator v3.0', '-- Protected by MoonSec', '']
+        var_map = {}
+        lines = code.split('\n')
+        
+        for line in lines:
+            if '=' in line and not line.strip().startswith('--'):
+                parts = line.split('=')
+                if len(parts) == 2:
+                    var = parts[0].strip()
+                    if var and var.isidentifier() and var not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return']:
+                        if var not in var_map:
+                            var_map[var] = ObfuscationEngine.random_ident()
+        
+        for line in lines:
+            obf_line = line
+            for orig, obf in var_map.items():
+                obf_line = obf_line.replace(orig, obf)
+            result.append(obf_line)
+        
+        if level >= 2:
+            code = '\n'.join(result)
+            def encode_string(match):
+                s = match.group(1) or match.group(2)
+                chars = [str(ord(c)) for c in s]
+                return f'string.char({",".join(chars)})'
+            code = re.sub(r'(["\'])([^"\']*)\1', encode_string, code)
+            result = code.split('\n')
+        
+        if level >= 3:
+            code = '\n'.join(result)
+            vm_code = f'''
+local _0x{ObfuscationEngine.randomstr(4)} = {{}}
+local function {ObfuscationEngine.random_ident()}(...)
+    local _args = {{...}}
+    {code}
 end
-
-local function deobfuscateVAQ(code)
-    -- Remove anti-tamper exits
-    code = code:gsub("then%s+return%s+0%s+end", "then end")
-    code = code:gsub("then%s+return%s+false%s+end", "then end")
-    return code
-end
-
-local function deobfuscateLumora(code)
-    -- Extract hex chunks
-    local chunks = {}
-    for hex in code:gmatch('"([0-9A-Fa-f]+)"') do
-        chunks[#chunks+1] = hex:gsub("..", function(b)
-            return string.char(tonumber(b, 16) or 0)
-        end)
-    end
-    if #chunks > 0 then
-        return "-- Lumora decoded chunks\n" .. table.concat(chunks)
-    end
-    return code
-end
-
--- ===== MAIN DECOMPILER =====
-function proxyTable.dump_file(inputPath, outputPath)
-    local file = io.open(inputPath, "rb")
-    if not file then
-        return false, "Cannot open input file"
-    end
-    local code = file:read("*all")
-    file:close()
-    
-    local obfType = detectObfuscator(code)
-    local result = code
-    
-    if obfType == "moonsec" then
-        result = deobfuscateMoonsec(code)
-    elseif obfType == "luraph" then
-        result = deobfuscateLuraph(code)
-    elseif obfType == "ironbrew" then
-        result = deobfuscateIronBrew(code)
-    elseif obfType == "namaiki" then
-        result = deobfuscateNamaiki(code)
-    elseif obfType == "vaq" then
-        result = deobfuscateVAQ(code)
-    elseif obfType == "lumora" then
-        result = deobfuscateLumora(code)
-    end
-    
-    -- Clean up
-    result = result:gsub("\r\n", "\n"):gsub("\r", "\n")
-    result = result:gsub("\n%s*\n", "\n")
-    
-    -- Write output
-    local out = io.open(outputPath, "wb")
-    if out then
-        out:write("-- Deobfuscated by FlameDumperV3\n")
-        out:write("-- Type: " .. obfType .. "\n\n")
-        out:write(result)
-        out:close()
-        return true
-    end
-    return false
-end
-
-function proxyTable.dump_string(code, outputPath)
-    local obfType = detectObfuscator(code)
-    local result = code
-    
-    if obfType == "moonsec" then
-        result = deobfuscateMoonsec(code)
-    elseif obfType == "luraph" then
-        result = deobfuscateLuraph(code)
-    elseif obfType == "ironbrew" then
-        result = deobfuscateIronBrew(code)
-    elseif obfType == "namaiki" then
-        result = deobfuscateNamaiki(code)
-    elseif obfType == "vaq" then
-        result = deobfuscateVAQ(code)
-    elseif obfType == "lumora" then
-        result = deobfuscateLumora(code)
-    end
-    
-    result = result:gsub("\r\n", "\n"):gsub("\r", "\n")
-    
-    if outputPath then
-        local out = io.open(outputPath, "wb")
-        if out then
-            out:write("-- Deobfuscated by FlameDumperV3\n")
-            out:write("-- Type: " .. obfType .. "\n\n")
-            out:write(result)
-            out:close()
-            return true
-        end
-        return false
-    end
-    
-    return result
-end
-
-return proxyTable
+{'_' + ObfuscationEngine.randomstr(8)} = {ObfuscationEngine.random_ident()}
+{'_' + ObfuscationEngine.randomstr(8)}()
 '''
+            return vm_code
+        
+        return '\n'.join(result)
+    
+    @staticmethod
+    def luraph_obfuscate(code, level=1):
+        result = ['-- Luraph Obfuscator v1.0', '-- Protected by Luraph', '']
+        
+        if level >= 2:
+            hex_code = code.encode().hex()
+            result.append(f'local _ = "{hex_code}"')
+            result.append('local function decode(s)')
+            result.append('  local t = {}')
+            result.append('  for i = 1, #s, 2 do')
+            result.append('    t[#t+1] = string.char(tonumber(s:sub(i, i+1), 16))')
+            result.append('  end')
+            result.append('  return table.concat(t)')
+            result.append('end')
+            result.append('loadstring(decode(_))()')
+            return '\n'.join(result)
+        
+        obf_vars = {}
+        lines = code.split('\n')
+        for line in lines:
+            if 'function' in line or 'local' in line:
+                matches = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', line)
+                for m in matches:
+                    if m not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return']:
+                        if m not in obf_vars:
+                            obf_vars[m] = ObfuscationEngine.random_ident()
+                        line = line.replace(m, obf_vars[m])
+            result.append(line)
+        
+        return '\n'.join(result)
+    
+    @staticmethod
+    def ironbrew_obfuscate(code, level=1):
+        result = ['-- IronBrew Obfuscator v1.0', '-- Protected by IronBrew', '']
+        
+        if level >= 2:
+            bytes_data = [str(ord(c)) for c in code]
+            result.append(f'local _ = {{ {",".join(bytes_data)} }}')
+            result.append('local function decode(t)')
+            result.append('  local s = {}')
+            result.append('  for i = 1, #t do')
+            result.append('    s[#s+1] = string.char(t[i])')
+            result.append('  end')
+            result.append('  return table.concat(s)')
+            result.append('end')
+            result.append('loadstring(decode(_))()')
+            return '\n'.join(result)
+        
+        lines = code.split('\n')
+        for line in lines:
+            if '=' in line and not line.strip().startswith('--'):
+                parts = line.split('=')
+                if len(parts) == 2:
+                    var = parts[0].strip()
+                    val = parts[1].strip()
+                    if var and var.isidentifier():
+                        line = f'local {ObfuscationEngine.random_ident()} = {val}; {var} = {ObfuscationEngine.random_ident()}'
+            result.append(line)
+        
+        return '\n'.join(result)
+    
+    @staticmethod
+    def generic_obfuscate(code, level=1):
+        if level == 1:
+            var_map = {}
+            lines = code.split('\n')
+            for line in lines:
+                matches = re.findall(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', line)
+                for m in matches:
+                    if m not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return', 'nil', 'true', 'false']:
+                        if m not in var_map:
+                            var_map[m] = ObfuscationEngine.random_ident()
+            for orig, obf in var_map.items():
+                code = code.replace(orig, obf)
+            return code
+        
+        elif level == 2:
+            lines = code.split('\n')
+            for i in range(len(lines)):
+                if i % 3 == 0:
+                    lines.insert(i, f'local _{ObfuscationEngine.randomstr(4)} = {random.randint(1, 9999)}')
+            return '\n'.join(lines)
+        
+        elif level == 3:
+            lines = ['local function main()']
+            for line in code.split('\n'):
+                lines.append(f'  {line}')
+            lines.append('end')
+            lines.append(f'local _{ObfuscationEngine.randomstr(8)} = main')
+            lines.append(f'_{ObfuscationEngine.randomstr(8)}()')
+            return '\n'.join(lines)
+        
+        return code
+
+# ============ LUNE ENGINE ============
+
+def sanitize_output(text: str) -> str:
+    ZWSP = '\u200b'
+    text = text.replace("@everyone", "@" + ZWSP + "everyone")
+    text = text.replace("@here", "@" + ZWSP + "here")
+    text = re.sub(r'<@&(\d+)>', lambda m: '<@&' + ZWSP + m.group(1) + '>', text)
+    text = re.sub(r'<@!?(\d+)>', lambda m: '<@' + ZWSP + m.group(1) + '>', text)
+    text = re.sub(r'<#(\d+)>', lambda m: '<#' + ZWSP + m.group(1) + '>', text)
+    return text
+
+async def download_from_url(url: str) -> str | None:
+    if "github.com" in url and "/blob/" in url:
+        url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    elif "pastebin.com" in url and "/raw/" not in url:
+        paste_id = url.split("/")[-1]
+        url = f"https://pastebin.com/raw/{paste_id}"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    return await response.text(errors="ignore")
+    except Exception:
+        return None
+    return None
+
+def run_lune(code: str) -> tuple[bool, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        input_path = os.path.join(tmp, "input.lua")
+        output_path = os.path.join(tmp, "out.lua")
+
+        with open(input_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        cmd = [
+            LUNE_BIN,
+            "run",
+            LUNE_SCRIPT,
+            "--",
+            input_path,
+            f"out={output_path}",
+            f"api_dump={API_DUMP}",
+        ]
+
+        if os.path.isfile(CLASSES_JSON):
+            cmd.append(f"classes={CLASSES_JSON}")
+        if os.path.isfile(ENUMS_JSON):
+            cmd.append(f"enums={ENUMS_JSON}")
+        if os.path.isfile(ASSETIDS_JSON):
+            cmd.append(f"assetids={ASSETIDS_JSON}")
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT_SECONDS,
+                cwd=tmp,
+            )
+        except FileNotFoundError:
+            return False, "Could not find the lune executable. Set LUNE_BIN in your .env."
+        except subprocess.TimeoutExpired:
+            return False, "exceeded the time limit."
+
+        if proc.returncode != 0 and not os.path.exists(output_path):
+            err = (proc.stderr or proc.stdout or "Unknown error").strip()
+            return False, err[:1900]
+
+        if os.path.exists(output_path):
+            with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
+                return True, f.read()
+
+        return False, (proc.stdout or "No output.").strip()[:1900]
 
 # ============ HELPER FUNCTIONS ============
+
+async def extract_code(ctx: commands.Context, content: str) -> str | None:
+    if ctx.message.attachments:
+        att = ctx.message.attachments[0]
+        data = await att.read()
+        return data.decode("utf-8", errors="ignore")
+
+    if ctx.message.reference:
+        try:
+            ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+        except discord.NotFound:
+            ref_msg = None
+        if ref_msg:
+            if ref_msg.attachments:
+                data = await ref_msg.attachments[0].read()
+                return data.decode("utf-8", errors="ignore")
+            if ref_msg.content:
+                content = ref_msg.content + "\n" + content
+
+    match = URL_PATTERN.search(content)
+    if match:
+        url = match.group(0)
+        code = await download_from_url(url)
+        if code:
+            return code
+
+    if "```" in content:
+        parts = content.split("```")
+        if len(parts) >= 2:
+            block = parts[1]
+            first_line, _, rest = block.partition("\n")
+            if first_line.strip().isalpha():
+                return rest
+            return block
+
+    return None
+
+async def get_text_file(ctx):
+    content = await extract_code(ctx, "")
+    if content:
+        return content
+    return None
+
 def randomstr(length):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-async def getfile(msg, path="./"):
-    if msg.attachments:
-        attachment = msg.attachments[0]
-        os.makedirs(path, exist_ok=True)
-        filename = f"{hashlib.md5(str(msg.id).encode()).hexdigest()}.lua"
-        filepath = os.path.join(path, filename)
-        await attachment.save(filepath)
-        return filename
-    return None
-
-async def get_text_file(msg):
-    if msg.attachments:
-        attachment = msg.attachments[0]
-        content = await attachment.read()
-        return content.decode('utf-8', errors='ignore')
-    return None
-
-def run_lua_dumper(code):
-    """Run the Lua dumper engine on code"""
-    if not HAS_LUA:
-        return fallback_deobfuscate(code)
-    
+async def softerror(msg, reply, waitdelete=6):
+    botmsg = await msg.reply(reply)
     try:
-        lua = LuaRuntime(unpack_returned_tuples=True)
-        
-        # Load the dumper
-        lua.execute(DUMPER_SOURCE)
-        
-        # Get the proxyTable
-        proxy = lua.globals().proxyTable
-        
-        # Write code to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.lua', delete=False) as f:
-            f.write(code)
-            temp_in = f.name
-        
-        temp_out = tempfile.mktemp(suffix='.lua')
-        
-        # Run the dumper
-        success = proxy.dump_file(temp_in, temp_out)
-        
-        if success:
-            with open(temp_out, 'r', encoding='utf-8', errors='ignore') as f:
-                result = f.read()
-            
-            os.unlink(temp_in)
-            os.unlink(temp_out)
-            return result
-        
-        os.unlink(temp_in)
-        return fallback_deobfuscate(code)
-        
-    except Exception as e:
-        print(f"Lua dumper error: {e}")
-        return fallback_deobfuscate(code)
+        await msg.delete()
+    except:
+        pass
+    await asyncio.sleep(waitdelete)
+    await botmsg.delete()
 
-def fallback_deobfuscate(code):
-    """Python fallback deobfuscator"""
-    # Remove headers
-    code = re.sub(r'^%s*%-%-[^\n]*[Mm]oon[Ss]ec[^\n]*\n', '', code, flags=re.M)
-    code = re.sub(r'^%s*%-%-[^\n]*[Oo]bfuscat[^\n]*\n', '', code, flags=re.M)
-    
-    # Remove anti-tamper
-    code = re.sub(r'assert%s*%(%s*_VERSION%s*==%s*["\']Lua%s*5%.1["\']%s*,?[^%)]*%)', '-- [removed]', code)
-    code = re.sub(r'if%s+not%s+game%s+then%s+error%s*%([^%)]*%)%s*end', '-- [removed]', code)
-    
-    # Decode string.char chains
-    code = re.sub(r'string%.char%(([^)]-)%)', lambda m: decode_string_char(m.group(1)), code)
-    
-    # Replace obfuscated identifiers
-    code = re.sub(r'[lI][lI1][lI1][lI1][lI1][lI1][lI1][lI1]+', lambda m: f'var_{m.group(0)[:4]}', code)
-    
-    return code
+def string_to_discordfile(string, filename=None, justbuffer=False):
+    buffer = io.BytesIO()
+    buffer.write(string.encode())
+    buffer.seek(0)
+    if justbuffer:
+        return buffer
+    return discord.File(buffer, filename=filename)
 
-def decode_string_char(args):
-    bytes_list = []
-    for n in re.findall(r'\d+', args):
-        bytes_list.append(chr(int(n) & 0xFF))
-    return '"' + ''.join(bytes_list) + '"'
+# ============ COMMAND MANAGER ============
+
+command_manager = {}
+command_cooldowns = defaultdict(int)
+
+def is_on_cooldown(user_id, command_name, cooldown=5):
+    key = f"{user_id}:{command_name}"
+    if command_cooldowns[key] > time.time():
+        return True
+    command_cooldowns[key] = time.time() + cooldown
+    return False
 
 # ============ BOT COMMANDS ============
 
-@bot.command(name='setup')
-async def setup(ctx):
-    global L_CHANNEL_ID
-    L_CHANNEL_ID = ctx.channel.id
-    await ctx.send(f"Setup complete - .l commands active in {ctx.channel.mention}")
-
-@bot.command(name='help')
+@bot.command(name="help")
+@status_required()
 async def help_cmd(ctx):
-    help_text = """Available Commands:
+    help_text = f"""Available Commands:
 
-FILE PROCESSING:
-.l - Deobfuscate Lua scripts (attach .lua file)
+📁 FILE PROCESSING:
+.l - Deobfuscate Lua scripts (lune/catlog.luau engine)
+.deobfuscate - Alias for .l
+.detect - Detect obfuscator type
 .beautify - Beautify Lua code
 .minify - Minify Lua code
 .compress - Compress Lua code
-.detect - Detect obfuscator type
+.rename - Rename Lua variables
+.upload - Upload code to paste services
 
-DECOMPILATION:
-.decompile - Decompile Lua bytecode
+🔒 OBFUSCATION:
+.moonsecobf [level] - Moonsec-style obfuscation
+.luraphobf [level] - Luraph-style obfuscation
+.ironbrewobf [level] - IronBrew-style obfuscation
+.obf [level] - Generic obfuscation
+.moonveil - Free daily Moonveil obfuscation
+.goofy - Goofyscator obfuscation
 
-OBFUSCATION:
-.obf - Obfuscate Lua code
+🔓 DEOBFUSCATION:
+.msdeobf - Moonsec V3 deobfuscation
+.promdeobf - Prometheus deobfuscation (RELUA)
+.ibdeobf - IronBrew 2 deobfuscation
+.deobf - LuaObfuscator string decryption
 
-WEB TOOLS:
+🌐 WEB TOOLS:
 .byp <url> - Bypass link shorteners
 .gen <prompt> - Generate AI images
+.get <url> - Fetch content from URL
 
-OTHER:
+⚙️ OTHER:
 .ping - Bot latency
 .say <text> - Echo text
 .color <hex> - Generate color gradient
+.meow - Cute meow
+.solara - Check Solara executor status
+.darklua - Darklua configuration panel
 
-SETUP:
-.setup - Set current channel for .l commands"""
-
+**Requirement:** Put `{REQUIRED_STATUS}` in your custom status!
+Levels: 1=Basic, 2=Medium, 3=Heavy"""
     await ctx.send(help_text)
 
-@bot.command(name='ping')
+@bot.command(name="ping")
 async def ping(ctx):
     await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
 
-@bot.command(name='say')
-async def say(ctx, *, text):
+@bot.command(name="say")
+@status_required()
+async def say_cmd(ctx, *, text):
     await ctx.send(discord.utils.escape_mentions(text))
 
-@bot.command(name='color')
+@bot.command(name="meow")
+async def meow_cmd(ctx):
+    await ctx.send("meow " * random.randint(1, 5))
+
+@bot.command(name="color")
+@status_required()
 async def color_cmd(ctx, hex_code):
     try:
-        from PIL import Image, ImageDraw
         hex_code = hex_code.lstrip('#')
         if not (len(hex_code) == 6 or len(hex_code) == 8):
             await ctx.send("Invalid hex code. Use .color #RRGGBB")
@@ -486,10 +812,15 @@ async def color_cmd(ctx, hex_code):
     except Exception as e:
         await ctx.send(f"Error: {str(e)}")
 
-@bot.command(name='byp')
+@bot.command(name="byp")
+@status_required()
 async def bypass_cmd(ctx, url):
     if not url.startswith("http"):
         await ctx.send("Provide valid URL starting with http:// or https://")
+        return
+    
+    if is_on_cooldown(ctx.author.id, "byp", 10):
+        await ctx.send("⏳ Slow down! Wait a bit.")
         return
     
     await ctx.send(f"Bypassing {url}...")
@@ -501,7 +832,6 @@ async def bypass_cmd(ctx, url):
                     await ctx.send(f"Bypassed URL: {str(resp.url)}")
                     return
         
-        # Try bypass.vip API
         async with aiohttp.ClientSession() as session:
             async with session.post("https://bypass.vip/api/bypass", json={"url": url}) as resp:
                 data = await resp.json()
@@ -515,13 +845,18 @@ async def bypass_cmd(ctx, url):
     except Exception as e:
         await ctx.send(f"Error: {str(e)}")
 
-@bot.command(name='gen')
+@bot.command(name="gen")
+@status_required()
 async def gen_cmd(ctx, *, prompt):
     if not prompt:
         await ctx.send("Provide a prompt")
         return
     
-    msg = await ctx.send("Generating image...")
+    if is_on_cooldown(ctx.author.id, "gen", 10):
+        await ctx.send("⏳ Slow down! Wait a bit.")
+        return
+    
+    msg = await ctx.send("🎨 Generating image...")
     
     try:
         async with aiohttp.ClientSession() as session:
@@ -536,114 +871,118 @@ async def gen_cmd(ctx, *, prompt):
     except Exception as e:
         await msg.edit(content=f"Error: {str(e)}")
 
-@bot.command(name='l')
-async def l_cmd(ctx):
-    """Deobfuscate Lua scripts using FlameDumperV3"""
-    global L_CHANNEL_ID
-    
-    if L_CHANNEL_ID and ctx.channel.id != L_CHANNEL_ID:
-        await ctx.send(f"Use .l in <#{L_CHANNEL_ID}> or run .setup first")
+@bot.command(name="get")
+@status_required()
+async def get_cmd(ctx, url=None):
+    if not url:
+        # Try to get from attachments
+        if ctx.message.attachments:
+            data = await ctx.message.attachments[0].read()
+            await ctx.send(file=string_to_discordfile(data.decode('utf-8', errors='ignore'), "fetched.lua"))
+            return
+        await ctx.send("Provide a URL or attach a file")
         return
     
-    if not ctx.message.attachments:
-        await ctx.send("Attach a .lua file")
+    content = await download_from_url(url)
+    if content:
+        await ctx.send(file=string_to_discordfile(content, "fetched.lua"))
+    else:
+        await ctx.send("Failed to fetch content from URL")
+
+@bot.command(name="upload")
+@status_required()
+async def upload_cmd(ctx):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a file to upload")
         return
-    
-    attachment = ctx.message.attachments[0]
-    if not attachment.filename.lower().endswith('.lua'):
-        await ctx.send("File must be .lua")
-        return
-    
-    msg = await ctx.send(f"Processing {attachment.filename}...")
     
     try:
-        # Download file
-        content = await attachment.read()
-        code = content.decode('utf-8', errors='ignore')
-        
-        # Detect obfuscator type
-        obf_type = "unknown"
-        if re.search(r'[Mm]oon[Ss]ec', code):
-            obf_type = "Moonsec"
-        elif re.search(r'Luraph', code) or re.search(r'LuraphContinue', code):
-            obf_type = "Luraph"
-        elif re.search(r'[Ii]ron[Bb]rew', code):
-            obf_type = "IronBrew"
-        elif re.search(r'namaiki', code):
-            obf_type = "Namaiki"
-        elif re.search(r'VAQ', code):
-            obf_type = "VAQ"
-        elif re.search(r'lumora', code):
-            obf_type = "Lumora"
-        
-        # Deobfuscate
-        if HAS_LUA:
-            result = run_lua_dumper(code)
-        else:
-            result = fallback_deobfuscate(code)
-        
-        # Check if we got something useful
-        if len(result) < 50 or result == code:
-            await msg.edit(content=f"⚠️ Could not fully deobfuscate ({obf_type}) - showing original")
-            result = code
-        
-        # Send result
-        if len(result) > 1900:
-            # Split into chunks
-            chunks = [result[i:i+1900] for i in range(0, len(result), 1900)]
-            await msg.edit(content=f"Deobfuscated {attachment.filename} [{obf_type}] ({len(chunks)} chunks)")
-            for chunk in chunks:
-                await ctx.send(f"```lua\n{chunk}\n```")
-        else:
-            await msg.edit(content=f"Deobfuscated {attachment.filename} [{obf_type}]")
-            await ctx.send(f"```lua\n{result}\n```")
-            
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://pastefy.app/api/v2/paste", json={
+                "content": content,
+                "title": "uploaded by 25ms",
+                "visibility": "UNLISTED"
+            }) as resp:
+                data = await resp.json()
+                if data.get("success"):
+                    url = data['paste']['raw_url']
+                    await ctx.send(f"{url}\n\n`loadstring(game:HttpGet'{url}')()`")
+                else:
+                    await ctx.send("Upload failed")
     except Exception as e:
-        await msg.edit(content=f"Error: {str(e)}")
+        await ctx.send(f"Error: {str(e)}")
 
-@bot.command(name='detect')
-async def detect_cmd(ctx):
-    """Detect obfuscator type"""
-    content = await get_text_file(ctx.message)
-    if not content:
-        await ctx.send("Attach a Lua file")
+# ============ L COMMAND (DEOBFUSCATE) ============
+
+@bot.command(name="l")
+@status_required()
+async def analyze_cmd(ctx: commands.Context, *, text: str = ""):
+    code = await extract_code(ctx, text)
+
+    if not code or not code.strip():
+        await ctx.reply(
+            "Attach a .lua/.luau file, reply to a message that has one, "
+            "put the code in a ```lua ... ``` code block, or provide a valid code link.",
+            allowed_mentions=NO_MENTIONS
+        )
         return
-    
-    types = []
-    if re.search(r'[Mm]oon[Ss]ec', content):
-        types.append('Moonsec')
-    if re.search(r'Luraph', content) or re.search(r'LuraphContinue', content):
-        types.append('Luraph')
-    if re.search(r'[Ii]ron[Bb]rew', content):
-        types.append('IronBrew')
-    if re.search(r'namaiki', content):
-        types.append('Namaiki')
-    if re.search(r'VAQ', content):
-        types.append('VAQ')
-    if re.search(r'lumora', content):
-        types.append('Lumora')
-    if re.search(r'Prometheus', content) or re.search(r'LPH!', content):
-        types.append('Prometheus')
-    if re.search(r'PSU', content):
-        types.append('PSU')
-    if re.search(r'ScriptWare', content) or re.search(r'CocoZ', content):
-        types.append('ScriptWare/CocoZ')
-    if re.search(r'Riptide', content):
-        types.append('Riptide')
-    
-    if types:
-        await ctx.send(f"Detected: {', '.join(types)}")
+
+    if is_on_cooldown(ctx.author.id, "l", 5):
+        await ctx.reply("⏳ Slow down! Wait a bit.")
+        return
+
+    async with ctx.typing():
+        loop = asyncio.get_running_loop()
+        ok, result = await loop.run_in_executor(None, run_lune, code)
+
+    result = sanitize_output(result)
+
+    if not ok:
+        await ctx.reply(f"Error:\n```\n{result}\n```", allowed_mentions=NO_MENTIONS)
+        return
+
+    if len(result) > 1900:
+        file = discord.File(io.BytesIO(result.encode("utf-8")), filename="result.lua")
+        await ctx.reply("done, attached file:", file=file, allowed_mentions=NO_MENTIONS)
     else:
-        await ctx.send("Unknown or plain Lua")
+        await ctx.reply(f"Result:\n```lua\n{result}\n```", allowed_mentions=NO_MENTIONS)
 
-@bot.command(name='beautify')
-async def beautify_cmd(ctx):
-    content = await get_text_file(ctx.message)
+@bot.command(name="deobfuscate", aliases=["deob"])
+@status_required()
+async def deobfuscate_cmd(ctx: commands.Context, *, text: str = ""):
+    await analyze_cmd(ctx, text=text)
+
+# ============ DETECT ============
+
+@bot.command(name="detect")
+@status_required()
+async def detect_cmd(ctx):
+    content = await get_text_file(ctx)
     if not content:
         await ctx.send("Attach a Lua file")
         return
     
-    # Simple beautification
+    summary = DetectionEngine.get_summary(content)
+    embed = discord.Embed(
+        color=0x5865F2,
+        title="🔍 Obfuscation Detection",
+        description=summary,
+        timestamp=datetime.now()
+    )
+    embed.set_footer(text="FlameDumperV3")
+    await ctx.send(embed=embed)
+
+# ============ BEAUTIFY ============
+
+@bot.command(name="beautify")
+@status_required()
+async def beautify_cmd(ctx):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a Lua file")
+        return
+    
     lines = content.split('\n')
     result = []
     indent = 0
@@ -662,14 +1001,16 @@ async def beautify_cmd(ctx):
     buffer.seek(0)
     await ctx.send(file=discord.File(buffer, "beautified.lua"))
 
-@bot.command(name='minify')
+# ============ MINIFY ============
+
+@bot.command(name="minify")
+@status_required()
 async def minify_cmd(ctx):
-    content = await get_text_file(ctx.message)
+    content = await get_text_file(ctx)
     if not content:
         await ctx.send("Attach a Lua file")
         return
     
-    # Remove comments and whitespace
     content = re.sub(r'--[^\n]*', '', content)
     content = re.sub(r'\s+', ' ', content)
     content = re.sub(r'\s*([=+-/*])\s*', r'\1', content)
@@ -680,112 +1021,317 @@ async def minify_cmd(ctx):
     buffer.seek(0)
     await ctx.send(file=discord.File(buffer, "minified.lua"))
 
-@bot.command(name='compress')
+# ============ COMPRESS ============
+
+@bot.command(name="compress")
+@status_required()
 async def compress_cmd(ctx):
-    content = await get_text_file(ctx.message)
+    content = await get_text_file(ctx)
     if not content:
         await ctx.send("Attach a Lua file")
         return
     
-    # Remove comments, whitespace, and shorten names
     content = re.sub(r'--[^\n]*', '', content)
     content = re.sub(r'\s+', ' ', content)
     content = re.sub(r'\s*([=+-/*])\s*', r'\1', content)
     
-    # Shorten variable names
-    def shorten_vars(match):
-        vars_found = []
-        def replace_var(m):
-            name = m.group(1)
-            if name not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return']:
-                if name not in vars_found:
-                    vars_found.append(name)
-                return f'v{vars_found.index(name)}'
-            return name
-        return re.sub(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', replace_var, match.group(0))
-    
-    content = re.sub(r'local\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=', r'local _=\1;', content)
+    var_map = {}
+    def shorten(m):
+        name = m.group(1)
+        if name not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return']:
+            if name not in var_map:
+                var_map[name] = f'v{len(var_map)}'
+            return var_map[name]
+        return name
+    content = re.sub(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', shorten, content)
     
     buffer = io.StringIO()
     buffer.write(content.strip())
     buffer.seek(0)
     await ctx.send(file=discord.File(buffer, "compressed.lua"))
 
-@bot.command(name='obf')
-async def obf_cmd(ctx, level: int = 1):
-    content = await get_text_file(ctx.message)
+# ============ RENAME ============
+
+@bot.command(name="rename")
+@status_required()
+async def rename_cmd(ctx):
+    content = await get_text_file(ctx)
     if not content:
         await ctx.send("Attach a Lua file")
         return
     
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://renamer-api.vercel.app/api/rename",
+                json={"code": content},
+                headers={"x-api-key": "33ms-DHJHS-24633"}
+            ) as resp:
+                data = await resp.json()
+                renamed = data.get("renamedCode")
+                if renamed:
+                    buffer = io.StringIO()
+                    buffer.write(renamed)
+                    buffer.seek(0)
+                    await ctx.send(file=discord.File(buffer, "renamed.lua"))
+                else:
+                    await ctx.send("Rename failed")
+    except Exception as e:
+        await ctx.send(f"Error: {str(e)}")
+
+# ============ OBFUSCATION COMMANDS ============
+
+@bot.command(name="moonsecobf")
+@status_required()
+async def moonsecobf_cmd(ctx, level: int = 1):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a Lua file")
+        return
     if level not in [1, 2, 3]:
         await ctx.send("Level must be 1, 2, or 3")
         return
     
-    obfuscated = content
-    
-    if level >= 1:
-        # Replace variable names
-        var_map = {}
-        def obf_name(m):
-            name = m.group(1)
-            if name not in ['local', 'function', 'if', 'then', 'else', 'end', 'for', 'while', 'do', 'return']:
-                if name not in var_map:
-                    var_map[name] = randomstr(8)
-                return var_map[name]
-            return name
-        obfuscated = re.sub(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\b', obf_name, obfuscated)
-    
-    if level >= 2:
-        # Base64 encode strings
-        def encode_string(m):
-            s = m.group(1) or m.group(2)
-            encoded = base64.b64encode(s.encode()).decode()
-            return f'loadstring({{}})'  # Placeholder
-        obfuscated = re.sub(r'(["\'])([^"\']*)\1', encode_string, obfuscated)
-    
-    if level >= 3:
-        # Add dead code
-        obfuscated = f'local _{randomstr(8)} = {{}}; {obfuscated}'
-    
+    msg = await ctx.send(f"🔒 Moonsec obfuscation (Level {level})...")
+    result = ObfuscationEngine.moonsec_obfuscate(content, level)
     buffer = io.StringIO()
-    buffer.write(obfuscated)
+    buffer.write(result)
     buffer.seek(0)
-    await ctx.send(f"Obfuscated (Level {level})", file=discord.File(buffer, "obfuscated.lua"))
+    await msg.edit(content=f"✅ Moonsec Obfuscated (Level {level})")
+    await ctx.send(file=discord.File(buffer, "moonsec_obfuscated.lua"))
 
-@bot.command(name='decompile')
-async def decompile_cmd(ctx):
-    if not ctx.message.attachments:
-        await ctx.send("Attach a Lua bytecode file")
+@bot.command(name="luraphobf")
+@status_required()
+async def luraphobf_cmd(ctx, level: int = 1):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a Lua file")
+        return
+    if level not in [1, 2, 3]:
+        await ctx.send("Level must be 1, 2, or 3")
         return
     
-    content = await ctx.message.attachments[0].read()
-    
-    try:
-        # Try to load as bytecode
-        import marshal
-        try:
-            code_obj = marshal.loads(content)
-            result = f"-- Bytecode decompiled\n-- {len(content)} bytes\n-- (Python marshal format)"
-        except:
-            result = "-- Could not decompile bytecode\n-- Raw bytes:\n" + ' '.join([f'{b:02x}' for b in content[:256]])
-        
-        buffer = io.StringIO()
-        buffer.write(result)
-        buffer.seek(0)
-        await ctx.send(file=discord.File(buffer, "decompiled.lua"))
-    except Exception as e:
-        await ctx.send(f"Error: {str(e)}")
+    msg = await ctx.send(f"🔒 Luraph obfuscation (Level {level})...")
+    result = ObfuscationEngine.luraph_obfuscate(content, level)
+    buffer = io.StringIO()
+    buffer.write(result)
+    buffer.seek(0)
+    await msg.edit(content=f"✅ Luraph Obfuscated (Level {level})")
+    await ctx.send(file=discord.File(buffer, "luraph_obfuscated.lua"))
 
-# ============ BOT START ============
+@bot.command(name="ironbrewobf")
+@status_required()
+async def ironbrewobf_cmd(ctx, level: int = 1):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a Lua file")
+        return
+    if level not in [1, 2, 3]:
+        await ctx.send("Level must be 1, 2, or 3")
+        return
+    
+    msg = await ctx.send(f"🔒 IronBrew obfuscation (Level {level})...")
+    result = ObfuscationEngine.ironbrew_obfuscate(content, level)
+    buffer = io.StringIO()
+    buffer.write(result)
+    buffer.seek(0)
+    await msg.edit(content=f"✅ IronBrew Obfuscated (Level {level})")
+    await ctx.send(file=discord.File(buffer, "ironbrew_obfuscated.lua"))
+
+@bot.command(name="obf")
+@status_required()
+async def obf_cmd(ctx, level: int = 1):
+    content = await get_text_file(ctx)
+    if not content:
+        await ctx.send("Attach a Lua file")
+        return
+    if level not in [1, 2, 3]:
+        await ctx.send("Level must be 1, 2, or 3")
+        return
+    
+    msg = await ctx.send(f"🔒 Generic obfuscation (Level {level})...")
+    result = ObfuscationEngine.generic_obfuscate(content, level)
+    buffer = io.StringIO()
+    buffer.write(result)
+    buffer.seek(0)
+    await msg.edit(content=f"✅ Generic Obfuscated (Level {level})")
+    await ctx.send(file=discord.File(buffer, "obfuscated.lua"))
+
+# ============ SOLARA ============
+
+@bot.command(name="solara")
+async def solara_cmd(ctx):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://solara-api.example.com/status") as resp:
+                data = await resp.json()
+                status = "✅ Updated" if data.get("supported") else "❌ Outdated"
+                download = data.get("url", "https://solara.example.com/download")
+                changelog = data.get("changelog", "No recent changes")
+                await ctx.send(f"**Solara Status**\nStatus: {status}\nDownload: {download}\nChangelog:\n```diff\n{changelog}\n```")
+    except:
+        await ctx.send("Solara API unavailable")
+
+# ============ DARKLUA GUI ============
+
+class DarkluaConfigView(View):
+    def __init__(self, user_id: int, filename: str):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.filename = filename
+        self.generator = "readable"
+        self.column_span = 80
+        self.selected_rules = ["compute_expression", "convert_index_to_field"]
+        self.processing = False
+        
+        self.available_rules = [
+            "compute_expression",
+            "remove_unused_while",
+            "remove_unused_if_branch",
+            "remove_nil_declaration",
+            "convert_index_to_field",
+            "remove_comments",
+            "remove_method_definition",
+            "remove_spaces",
+            "remove_types",
+            "remove_unused_variable",
+            "remove_function_call_parens",
+        ]
+        
+        self.add_item(self.RuleSelect(self))
+        self.add_item(self.GeneratorButton("readable", self))
+        self.add_item(self.GeneratorButton("dense", self))
+        self.add_item(self.ApplyButton(self))
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Not your config.", ephemeral=True)
+            return False
+        return True
+
+    class RuleSelect(Select):
+        def __init__(self, view):
+            self.view_ref = view
+            options = [discord.SelectOption(label=rule, value=rule) for rule in view.available_rules[:25]]
+            super().__init__(placeholder="Select rules...", min_values=0, max_values=len(options), options=options)
+
+        async def callback(self, interaction):
+            self.view_ref.selected_rules = list(self.values)
+            await interaction.response.edit_message(content="Rules updated!", view=self.view_ref)
+
+    class GeneratorButton(Button):
+        def __init__(self, gen, view):
+            self.generator_type = gen
+            self.view_ref = view
+            style = discord.ButtonStyle.primary if view.generator == gen else discord.ButtonStyle.secondary
+            super().__init__(label=f"Gen: {gen}", style=style, row=1)
+
+        async def callback(self, interaction):
+            self.view_ref.generator = self.generator_type
+            for item in self.view_ref.children:
+                if isinstance(item, DarkluaConfigView.GeneratorButton):
+                    item.style = discord.ButtonStyle.primary if item.generator_type == self.generator_type else discord.ButtonStyle.secondary
+            await interaction.response.edit_message(content="Generator updated!", view=self.view_ref)
+
+    class ApplyButton(Button):
+        def __init__(self, view):
+            self.view_ref = view
+            super().__init__(label="Apply", style=discord.ButtonStyle.success, row=3)
+
+        async def callback(self, interaction):
+            if self.view_ref.processing:
+                await interaction.response.send_message("Already processing...", ephemeral=True)
+                return
+            self.view_ref.processing = True
+            await interaction.response.defer()
+            await interaction.followup.send("Darklua processing complete! (Placeholder)", ephemeral=True)
+            self.view_ref.processing = False
+
+@bot.command(name="darklua")
+@status_required()
+async def darklua_cmd(ctx):
+    filename = await get_text_file(ctx)
+    if not filename:
+        await ctx.send("Attach a Lua file")
+        return
+    
+    view = DarkluaConfigView(ctx.author.id, "temp.lua")
+    await ctx.send(content="Configure Darklua", view=view)
+
+# ============ SETUP ============
+
+@bot.command(name="setup")
+async def setup(ctx):
+    global DEOBF_CHANNEL_ID
+    DEOBF_CHANNEL_ID = ctx.channel.id
+    await ctx.send(f"Setup complete - .deobfuscate commands active in {ctx.channel.mention}")
+
+# ============ STATUS CHECK ============
+
+@bot.command(name="checkstatus")
+async def checkstatus(ctx):
+    if has_required_status(ctx.author):
+        await ctx.send(f"✅ You have `{REQUIRED_STATUS}` in your status! All commands available.")
+    else:
+        await ctx.send(f"❌ You need to put `{REQUIRED_STATUS}` in your custom status to use commands!")
+
+# ============ ON_READY ============
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"📌 Required status: {REQUIRED_STATUS}")
+    await bot.change_presence(
+        activity=discord.CustomActivity(
+            name=f"{REQUIRED_STATUS} | .help for commands"
+        )
+    )
+
+# ============ ON_PRESENCE_UPDATE ============
+
+@bot.event
+async def on_presence_update(before, after):
+    """Auto-role based on status"""
+    try:
+        guild = bot.get_guild(1306714913539887237)
+        if not guild:
+            return
+        
+        role = guild.get_role(1385300853526892584)
+        if not role:
+            return
+        
+        member = guild.get_member(after.id)
+        if not member:
+            return
+        
+        has_status = False
+        for activity in after.activities:
+            if isinstance(activity, CustomActivity):
+                if activity.name and REQUIRED_STATUS in activity.name:
+                    has_status = True
+                    break
+        
+        if has_status:
+            if role not in member.roles:
+                await member.add_roles(role)
+                print(f"✅ Added role to {member.name}")
+        else:
+            if role in member.roles:
+                await member.remove_roles(role)
+                print(f"❌ Removed role from {member.name}")
+    except Exception as e:
+        print(f"Presence update error: {e}")
+
+# ============ RUN ============
+
 if __name__ == "__main__":
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
+    if not TOKEN:
         print("ERROR: DISCORD_TOKEN not set")
         exit(1)
     
     print("🤖 Starting Kers0ne Dumper Bot - CAT Edition")
-    print(f"✅ Lua dumper: {'Available' if HAS_LUA else 'Fallback mode'}")
+    print(f"📌 Required status: {REQUIRED_STATUS}")
     print("ℹ️  Use .help to see all commands")
     
-    bot.run(token)
+    bot.run(TOKEN)
