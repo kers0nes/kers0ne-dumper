@@ -24,16 +24,13 @@ import discord
 from discord.ext import commands
 from discord import CustomActivity
 from discord.ui import Button, View, Select
-from dotenv import load_dotenv
 import aiohttp
 import requests
 from PIL import Image, ImageDraw, ImageColor
 from hashlib import sha256
 
-load_dotenv()
-
-# ============ CONFIG ============
-TOKEN = os.getenv("DISCORD_TOKEN")
+# ============ CONFIG (No dotenv - use environment variables directly) ============
+TOKEN = os.environ.get("DISCORD_TOKEN")
 REQUIRED_STATUS = ".gg/KFdHVt3Mm6"
 OWNER_ID = 1123674631266639914
 DEOBF_CHANNEL_ID = None
@@ -45,11 +42,16 @@ API_DUMP = os.path.join(STUFF_DIR, "API-Dump.json")
 CLASSES_JSON = os.path.join(STUFF_DIR, "classes.json")
 ENUMS_JSON = os.path.join(STUFF_DIR, "enums.json")
 ASSETIDS_JSON = os.path.join(STUFF_DIR, "assetids.json")
-LUNE_BIN = os.getenv("LUNE_BIN", "lune")
+LUNE_BIN = os.environ.get("LUNE_BIN", "lune")
 TIMEOUT_SECONDS = 30
 
 NO_MENTIONS = discord.AllowedMentions.none()
 URL_PATTERN = re.compile(r'https?://\S+')
+
+if not TOKEN:
+    print("❌ ERROR: DISCORD_TOKEN environment variable not set!")
+    print("   Set it with: export DISCORD_TOKEN=your_token_here")
+    exit(1)
 
 # ============ BOT SETUP ============
 intents = discord.Intents.all()
@@ -638,7 +640,7 @@ def run_lune(code: str) -> tuple[bool, str]:
                 cwd=tmp,
             )
         except FileNotFoundError:
-            return False, "Could not find the lune executable. Set LUNE_BIN in your .env."
+            return False, "Could not find the lune executable. Set LUNE_BIN in your environment."
         except subprocess.TimeoutExpired:
             return False, "exceeded the time limit."
 
@@ -699,15 +701,6 @@ async def get_text_file(ctx):
 def randomstr(length):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-async def softerror(msg, reply, waitdelete=6):
-    botmsg = await msg.reply(reply)
-    try:
-        await msg.delete()
-    except:
-        pass
-    await asyncio.sleep(waitdelete)
-    await botmsg.delete()
-
 def string_to_discordfile(string, filename=None, justbuffer=False):
     buffer = io.BytesIO()
     buffer.write(string.encode())
@@ -715,18 +708,6 @@ def string_to_discordfile(string, filename=None, justbuffer=False):
     if justbuffer:
         return buffer
     return discord.File(buffer, filename=filename)
-
-# ============ COMMAND MANAGER ============
-
-command_manager = {}
-command_cooldowns = defaultdict(int)
-
-def is_on_cooldown(user_id, command_name, cooldown=5):
-    key = f"{user_id}:{command_name}"
-    if command_cooldowns[key] > time.time():
-        return True
-    command_cooldowns[key] = time.time() + cooldown
-    return False
 
 # ============ BOT COMMANDS ============
 
@@ -750,14 +731,6 @@ async def help_cmd(ctx):
 .luraphobf [level] - Luraph-style obfuscation
 .ironbrewobf [level] - IronBrew-style obfuscation
 .obf [level] - Generic obfuscation
-.moonveil - Free daily Moonveil obfuscation
-.goofy - Goofyscator obfuscation
-
-🔓 DEOBFUSCATION:
-.msdeobf - Moonsec V3 deobfuscation
-.promdeobf - Prometheus deobfuscation (RELUA)
-.ibdeobf - IronBrew 2 deobfuscation
-.deobf - LuaObfuscator string decryption
 
 🌐 WEB TOOLS:
 .byp <url> - Bypass link shorteners
@@ -770,14 +743,13 @@ async def help_cmd(ctx):
 .color <hex> - Generate color gradient
 .meow - Cute meow
 .solara - Check Solara executor status
-.darklua - Darklua configuration panel
 
 **Requirement:** Put `{REQUIRED_STATUS}` in your custom status!
 Levels: 1=Basic, 2=Medium, 3=Heavy"""
     await ctx.send(help_text)
 
 @bot.command(name="ping")
-async def ping(ctx):
+async def ping_cmd(ctx):
     await ctx.send(f"Pong! {round(bot.latency * 1000)}ms")
 
 @bot.command(name="say")
@@ -819,10 +791,6 @@ async def bypass_cmd(ctx, url):
         await ctx.send("Provide valid URL starting with http:// or https://")
         return
     
-    if is_on_cooldown(ctx.author.id, "byp", 10):
-        await ctx.send("⏳ Slow down! Wait a bit.")
-        return
-    
     await ctx.send(f"Bypassing {url}...")
     
     try:
@@ -852,10 +820,6 @@ async def gen_cmd(ctx, *, prompt):
         await ctx.send("Provide a prompt")
         return
     
-    if is_on_cooldown(ctx.author.id, "gen", 10):
-        await ctx.send("⏳ Slow down! Wait a bit.")
-        return
-    
     msg = await ctx.send("🎨 Generating image...")
     
     try:
@@ -875,7 +839,6 @@ async def gen_cmd(ctx, *, prompt):
 @status_required()
 async def get_cmd(ctx, url=None):
     if not url:
-        # Try to get from attachments
         if ctx.message.attachments:
             data = await ctx.message.attachments[0].read()
             await ctx.send(file=string_to_discordfile(data.decode('utf-8', errors='ignore'), "fetched.lua"))
@@ -926,10 +889,6 @@ async def analyze_cmd(ctx: commands.Context, *, text: str = ""):
             "put the code in a ```lua ... ``` code block, or provide a valid code link.",
             allowed_mentions=NO_MENTIONS
         )
-        return
-
-    if is_on_cooldown(ctx.author.id, "l", 5):
-        await ctx.reply("⏳ Slow down! Wait a bit.")
         return
 
     async with ctx.typing():
@@ -1172,92 +1131,6 @@ async def solara_cmd(ctx):
     except:
         await ctx.send("Solara API unavailable")
 
-# ============ DARKLUA GUI ============
-
-class DarkluaConfigView(View):
-    def __init__(self, user_id: int, filename: str):
-        super().__init__(timeout=300)
-        self.user_id = user_id
-        self.filename = filename
-        self.generator = "readable"
-        self.column_span = 80
-        self.selected_rules = ["compute_expression", "convert_index_to_field"]
-        self.processing = False
-        
-        self.available_rules = [
-            "compute_expression",
-            "remove_unused_while",
-            "remove_unused_if_branch",
-            "remove_nil_declaration",
-            "convert_index_to_field",
-            "remove_comments",
-            "remove_method_definition",
-            "remove_spaces",
-            "remove_types",
-            "remove_unused_variable",
-            "remove_function_call_parens",
-        ]
-        
-        self.add_item(self.RuleSelect(self))
-        self.add_item(self.GeneratorButton("readable", self))
-        self.add_item(self.GeneratorButton("dense", self))
-        self.add_item(self.ApplyButton(self))
-
-    async def interaction_check(self, interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Not your config.", ephemeral=True)
-            return False
-        return True
-
-    class RuleSelect(Select):
-        def __init__(self, view):
-            self.view_ref = view
-            options = [discord.SelectOption(label=rule, value=rule) for rule in view.available_rules[:25]]
-            super().__init__(placeholder="Select rules...", min_values=0, max_values=len(options), options=options)
-
-        async def callback(self, interaction):
-            self.view_ref.selected_rules = list(self.values)
-            await interaction.response.edit_message(content="Rules updated!", view=self.view_ref)
-
-    class GeneratorButton(Button):
-        def __init__(self, gen, view):
-            self.generator_type = gen
-            self.view_ref = view
-            style = discord.ButtonStyle.primary if view.generator == gen else discord.ButtonStyle.secondary
-            super().__init__(label=f"Gen: {gen}", style=style, row=1)
-
-        async def callback(self, interaction):
-            self.view_ref.generator = self.generator_type
-            for item in self.view_ref.children:
-                if isinstance(item, DarkluaConfigView.GeneratorButton):
-                    item.style = discord.ButtonStyle.primary if item.generator_type == self.generator_type else discord.ButtonStyle.secondary
-            await interaction.response.edit_message(content="Generator updated!", view=self.view_ref)
-
-    class ApplyButton(Button):
-        def __init__(self, view):
-            self.view_ref = view
-            super().__init__(label="Apply", style=discord.ButtonStyle.success, row=3)
-
-        async def callback(self, interaction):
-            if self.view_ref.processing:
-                await interaction.response.send_message("Already processing...", ephemeral=True)
-                return
-            self.view_ref.processing = True
-            await interaction.response.defer()
-            await interaction.followup.send("Darklua processing complete! (Placeholder)", ephemeral=True)
-            self.view_ref.processing = False
-
-@bot.command(name="darklua")
-@status_required()
-async def darklua_cmd(ctx):
-    filename = await get_text_file(ctx)
-    if not filename:
-        await ctx.send("Attach a Lua file")
-        return
-    
-    view = DarkluaConfigView(ctx.author.id, "temp.lua")
-    await ctx.send(content="Configure Darklua", view=view)
-
 # ============ SETUP ============
 
 @bot.command(name="setup")
@@ -1326,10 +1199,6 @@ async def on_presence_update(before, after):
 # ============ RUN ============
 
 if __name__ == "__main__":
-    if not TOKEN:
-        print("ERROR: DISCORD_TOKEN not set")
-        exit(1)
-    
     print("🤖 Starting Kers0ne Dumper Bot - CAT Edition")
     print(f"📌 Required status: {REQUIRED_STATUS}")
     print("ℹ️  Use .help to see all commands")
