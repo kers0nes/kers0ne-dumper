@@ -32,7 +32,10 @@ from PIL import Image, ImageDraw, ImageColor, ImageFont
 from hashlib import sha256
 
 # AI Imports
-from openai import AsyncOpenAI
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
 # from google import genai # Optional based on environment
 # from google.genai import types
 
