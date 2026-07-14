@@ -166,10 +166,10 @@ def run_deobfuscator(code: str) -> tuple[bool, str]:
                 with open(input_path, "w", encoding="utf-8") as f:
                     f.write(code)
                 
-                # Try to find catlog.luau
-                lune_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catlog.luau")
+                # Try to find main.luau (UnveilR engine)
+                lune_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dropbox_extracted", "main.luau")
                 if os.path.isfile(lune_script):
-                    cmd = [LUNE_BIN, "run", lune_script, "--", input_path, f"out={output_path}"]
+                    cmd = [LUNE_BIN, "run", lune_script, f"ipt={input_path}", f"out={output_path}", "version=3", "isPremium=true"]
                     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, cwd=tmp)
                     
                     if proc.returncode == 0 and os.path.exists(output_path):
@@ -1003,7 +1003,7 @@ async def beautify_cmd(ctx):
         if re.match(r'^(end|elseif|else|until|})', line):
             indent = max(0, indent - 1)
         result.append('    ' * indent + line)
-        if re.search(r'\b(then|do|function|if|elseif|else|for|while|repeat|{)s*$', line):
+        if re.search(r'\b(then|do|function|if|elseif|else|for|while|repeat|{)\s*$', line):
             indent += 1
     
     buffer = io.StringIO()
